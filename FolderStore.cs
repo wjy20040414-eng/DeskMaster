@@ -14,10 +14,22 @@ internal sealed record FolderAppearance(
     int ExpandedTextColor = 0,
     HorizontalAlignment ExpandedAlignment = HorizontalAlignment.Center);
 
+internal sealed record AnimationSettings(int FrameRate = 0, int SpeedPercent = 100)
+{
+    internal static IReadOnlyList<int> FrameRates { get; } = [0, 30, 60, 90, 120, 144];
+    internal static IReadOnlyList<int> Speeds { get; } = [50, 75, 100, 125, 150, 200];
+
+    internal AnimationSettings Normalize() => new(
+        FrameRates.Contains(FrameRate) ? FrameRate : 0,
+        Speeds.Contains(SpeedPercent) ? SpeedPercent : 100);
+}
+
 internal sealed class FolderStore(string path)
 {
     private sealed record Entry(Guid Id, string Name, int X, int Y, string[] Shortcuts, int IconColumns = 1,
         FolderAppearance? Appearance = null);
+
+    private string AnimationPath => Path.Combine(Path.GetDirectoryName(path)!, "animation.json");
 
     public static FolderStore ForCurrentUser() => new(Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeskMaster", "folders.json"));
@@ -41,11 +53,30 @@ internal sealed class FolderStore(string path)
 
     public void Save(IEnumerable<DesktopFolder> folders)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var entries = folders.Select(folder => new Entry(folder.Id, folder.Name,
             folder.Location.X, folder.Location.Y, folder.Shortcuts, folder.IconColumns, folder.Appearance));
-        string temporaryPath = path + ".tmp";
-        File.WriteAllBytes(temporaryPath, JsonSerializer.SerializeToUtf8Bytes(entries));
-        File.Move(temporaryPath, path, overwrite: true);
+        WriteJson(path, entries);
+    }
+
+    public AnimationSettings LoadAnimationSettings()
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<AnimationSettings>(File.ReadAllBytes(AnimationPath))?.Normalize() ?? new();
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return new();
+        }
+    }
+
+    public void SaveAnimationSettings(AnimationSettings settings) => WriteJson(AnimationPath, settings);
+
+    private static void WriteJson<T>(string filePath, T value)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+        string temporaryPath = filePath + ".tmp";
+        File.WriteAllBytes(temporaryPath, JsonSerializer.SerializeToUtf8Bytes(value));
+        File.Move(temporaryPath, filePath, overwrite: true);
     }
 }

@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
@@ -10,9 +11,12 @@ internal sealed class FolderWindow : Form
 {
     private static readonly FolderAppearance DefaultAppearance = new();
     internal const int CaptionHeight = 22;
+    private const int TransitionMilliseconds = 220;
+    private const int ShortcutIconSize = 32;
     private const string DesktopViewKey = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\Shell\Bags\1\Desktop";
     private readonly Func<DesktopFolder, bool> save;
     private readonly Func<DesktopFolder, Point?> findSlot;
+    private readonly Func<AnimationSettings> getAnimationSettings;
     private readonly int cardUnit;
     private readonly Button header;
     private readonly Button preview;
@@ -21,7 +25,6 @@ internal sealed class FolderWindow : Form
     private readonly BackgroundWindow backdrop;
     private readonly ContextMenuStrip menu;
     private readonly ToolTip tips = new();
-    private readonly System.Windows.Forms.Timer transition = new() { Interval = 15 };
     private readonly Dictionary<string, Bitmap> icons = new(StringComparer.OrdinalIgnoreCase);
     private DesktopFolder folder;
     private bool expanded;
@@ -31,7 +34,19 @@ internal sealed class FolderWindow : Form
     private Rectangle transitionFrom;
     private Rectangle transitionTo;
     private long transitionStarted;
+    private double transitionDuration;
+    private object? activeTransition;
     private double transitionOpacity;
+    private double expansion;
+    private double transitionFromExpansion;
+    private Rectangle expandedViewport;
+    private TransitionShortcut[] transitionShortcuts = [];
+    private string[]? displayedShortcuts;
+    private FolderAppearance? displayedAppearance;
+
+    private readonly record struct TransitionShortcut(string Path, string Name, Rectangle Thumbnail, Rectangle Tile);
+
+    private bool IsAnimating => activeTransition is not null;
     private FolderAppearance Appearance => folder.Appearance ?? DefaultAppearance;
     private Color Surface => AppearanceDialog.ToColor(Appearance.Background);
     private Color ExpandedTextColor => AppearanceDialog.ToColor(Appearance.ExpandedTextColor);
@@ -39,13 +54,14 @@ internal sealed class FolderWindow : Form
         ? Math.Clamp(percent, 20, 100) / 100.0 : expanded ? 0.86 : 0.62;
 
     public FolderWindow(DesktopFolder folder, Func<DesktopFolder, bool> save, Action delete,
-        Func<DesktopFolder, Point?> findSlot, int cardUnit)
+        Func<DesktopFolder, Point?> findSlot, int cardUnit,
+        Func<AnimationSettings> getAnimationSettings, Action<AnimationSettings> saveAnimationSettings)
     {
         this.folder = folder;
         this.save = save;
         this.findSlot = findSlot;
         this.cardUnit = cardUnit;
-        transition.Tick += (_, _) => AnimateTransition();
+        this.getAnimationSettings = getAnimationSettings;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
@@ -77,6 +93,7 @@ internal sealed class FolderWindow : Form
         };
         menu.Items.Add(sizeMenu);
         menu.Items.Add("外观…", null, (_, _) => EditAppearance());
+        menu.Items.Add(CreateAnimationMenu(saveAnimationSettings));
         menu.Items.Add("删除文件夹…", null, (_, _) =>
         {
             if (MessageBox.Show($"删除「{this.folder.Name}」？", "DeskMaster",
@@ -120,6 +137,42 @@ internal sealed class FolderWindow : Form
         ApplyAppearance();
         UpdateTitle();
         ApplyLocation(folder.Location);
+    }
+
+    private ToolStripMenuItem CreateAnimationMenu(Action<AnimationSettings> saveSettings)
+    {
+        var animationMenu = new ToolStripMenuItem("动画设置（全局）");
+        AddChoices("帧率", AnimationSettings.FrameRates,
+            rate => rate == 0 ? "自动（随屏幕刷新）" : $"{rate} FPS",
+            settings => settings.FrameRate, (settings, rate) => settings with { FrameRate = rate });
+        AddChoices("播放速度", AnimationSettings.Speeds,
+            speed => speed == 100 ? "1×（默认）" : $"{speed / 100m:0.##}×",
+            settings => settings.SpeedPercent, (settings, speed) => settings with { SpeedPercent = speed });
+        return animationMenu;
+
+        void AddChoices(string label, IReadOnlyList<int> values, Func<int, string> format,
+            Func<AnimationSettings, int> getValue, Func<AnimationSettings, int, AnimationSettings> setValue)
+        {
+            var group = new ToolStripMenuItem(label);
+            foreach (int value in values)
+            {
+                var item = new ToolStripMenuItem(format(value)) { Tag = value };
+                item.Click += (_, _) =>
+                {
+                    var current = getAnimationSettings();
+                    if (getValue(current) != value)
+                        saveSettings(setValue(current, value));
+                };
+                group.DropDownItems.Add(item);
+            }
+            menu.Opening += (_, _) =>
+            {
+                int current = getValue(getAnimationSettings());
+                foreach (ToolStripMenuItem item in group.DropDownItems)
+                    item.Checked = (int)item.Tag! == current;
+            };
+            animationMenu.DropDownItems.Add(group);
+        }
     }
 
     protected override CreateParams CreateParams
@@ -167,20 +220,39 @@ internal sealed class FolderWindow : Form
 
     private void Toggle()
     {
+        bool wasAnimating = IsAnimating;
+        var animationSettings = getAnimationSettings();
         transitionFrom = new Rectangle(Location, new Size(Width, Width));
         transitionOpacity = backdrop.Opacity;
+        transitionFromExpansion = expansion;
         expanded = !expanded;
         UpdateTitle();
-        Rectangle target = GetFolderBounds(folder.Location);
+        Rectangle target = GetFolderBounds(folder.Location, expanded);
         transitionTo = new Rectangle(target.Location, new Size(target.Width, target.Width));
+        if (!wasAnimating)
+        {
+            transitionDuration = TransitionMilliseconds * 100.0 / animationSettings.SpeedPercent;
+            if (expanded)
+            {
+                contents.Bounds = GetContentsBounds(target.Size);
+                // Create the handle while hidden so the measured viewport includes native scrollbars.
+                _ = contents.Handle;
+                RefreshContents();
+                contents.AutoScrollPosition = Point.Empty;
+            }
+            CaptureTransitionShortcuts();
+        }
+
         transitionStarted = Stopwatch.GetTimestamp();
-        transition.Start();
+        object animation = activeTransition ??= new object();
         caption.Hide();
         header.Hide();
         contents.Hide();
         preview.Show();
         Bounds = transitionFrom;
         preview.Invalidate();
+        if (!wasAnimating)
+            _ = RenderTransitionAsync(animation, animationSettings.FrameRate);
     }
 
     private sealed class ForegroundButton : Button
@@ -199,9 +271,44 @@ internal sealed class FolderWindow : Form
         }
     }
 
+    private async Task RenderTransitionAsync(object animation, int frameRate)
+    {
+        long clockStarted = transitionStarted;
+        double frameInterval = frameRate == 0 ? 0 : 1000.0 / frameRate;
+        double nextFrame = 0;
+        while (activeTransition == animation)
+        {
+            // Wait off the UI thread. Queue only one frame so input and painting can keep up.
+            await Task.Run(WaitForNextFrameAsync);
+            if (activeTransition != animation)
+                return;
+
+            if (frameInterval > 0)
+            {
+                long now = Stopwatch.GetTimestamp();
+                double elapsed = Stopwatch.GetElapsedTime(clockStarted, now).TotalMilliseconds;
+                bool complete = Stopwatch.GetElapsedTime(transitionStarted, now).TotalMilliseconds >= transitionDuration;
+                // Allow for compositor jitter, and finish on time even between scheduled frames.
+                if (elapsed + 1 < nextFrame && !complete)
+                    continue;
+                nextFrame = elapsed >= nextFrame + frameInterval ? elapsed + frameInterval : nextFrame + frameInterval;
+            }
+
+            AnimateTransition();
+            preview.Update();
+        }
+    }
+
+    private static async Task WaitForNextFrameAsync()
+    {
+        long started = Stopwatch.GetTimestamp();
+        if (DwmFlush() != 0 || Stopwatch.GetElapsedTime(started).TotalMilliseconds < 1)
+            await Task.Delay(8).ConfigureAwait(false);
+    }
+
     private void AnimateTransition()
     {
-        double progress = Stopwatch.GetElapsedTime(transitionStarted).TotalMilliseconds / 180;
+        double progress = Stopwatch.GetElapsedTime(transitionStarted).TotalMilliseconds / transitionDuration;
         if (progress >= 1)
         {
             ApplyLocation(folder.Location);
@@ -209,12 +316,19 @@ internal sealed class FolderWindow : Form
         }
 
         double eased = progress * progress * (3 - 2 * progress);
-        int Interpolate(int from, int to) => (int)Math.Round(from + (to - from) * eased);
-        int side = Interpolate(transitionFrom.Width, transitionTo.Width);
-        Bounds = new Rectangle(Interpolate(transitionFrom.X, transitionTo.X),
-            Interpolate(transitionFrom.Y, transitionTo.Y), side, side);
+        expansion = Lerp(transitionFromExpansion, expanded ? 1 : 0, eased);
+        Bounds = Lerp(transitionFrom, transitionTo, eased);
         backdrop.Opacity = transitionOpacity + (TargetOpacity - transitionOpacity) * eased;
+        preview.Invalidate();
     }
+
+    private static double Lerp(double from, double to, double progress) => from + (to - from) * progress;
+
+    private static int Lerp(int from, int to, double progress) => (int)Math.Round(Lerp((double)from, to, progress));
+
+    private static Rectangle Lerp(Rectangle from, Rectangle to, double progress) => new(
+        Lerp(from.X, to.X, progress), Lerp(from.Y, to.Y, progress),
+        Lerp(from.Width, to.Width, progress), Lerp(from.Height, to.Height, progress));
 
     private void UpdateTitle()
     {
@@ -234,11 +348,11 @@ internal sealed class FolderWindow : Form
         return cardUnit * columns - captionOffset;
     }
 
-    private Rectangle GetFolderBounds(Point requested)
+    private Rectangle GetFolderBounds(Point requested, bool isExpanded)
     {
         var area = Screen.FromPoint(requested).WorkingArea;
-        int captionHeight = expanded ? 0 : CaptionHeight;
-        int side = expanded ? 240 : CollapsedSide(cardUnit, folder.IconColumns);
+        int captionHeight = isExpanded ? 0 : CaptionHeight;
+        int side = isExpanded ? 240 : CollapsedSide(cardUnit, folder.IconColumns);
         side = Math.Min(side, Math.Min(area.Width, area.Height - captionHeight));
         int height = side + captionHeight;
         int left = Math.Clamp(requested.X, area.Left, area.Right - side);
@@ -248,16 +362,15 @@ internal sealed class FolderWindow : Form
 
     private void ApplyLocation(Point requested)
     {
-        bool wasAnimating = transition.Enabled;
-        transition.Stop();
+        activeTransition = null;
+        expansion = expanded ? 1 : 0;
+        transitionShortcuts = [];
         backdrop.Opacity = TargetOpacity;
-        Bounds = GetFolderBounds(requested);
+        Bounds = GetFolderBounds(requested, expanded);
         header.Visible = expanded;
         contents.Visible = expanded;
         preview.Visible = !expanded;
         caption.Visible = !expanded;
-        if (wasAnimating && expanded)
-            RefreshContents();
         preview.Invalidate();
     }
 
@@ -274,16 +387,20 @@ internal sealed class FolderWindow : Form
             backdrop.Bounds = new Rectangle(Location, new Size(side, side));
             backdrop.Region = region.Clone();
         }
-        if (!expanded && !transition.Enabled)
+        if (!expanded && !IsAnimating)
             region.Union(new Rectangle(0, side, side, CaptionHeight));
         Region = region;
 
         header.Bounds = new Rectangle(12, 4, Math.Max(0, Width - 24), 30);
         preview.Bounds = new Rectangle(0, 0, side, side);
         caption.Bounds = new Rectangle(0, side, side, CaptionHeight);
-        contents.Bounds = new Rectangle(8, 36, Math.Max(0, Width - 16), Math.Max(0, Height - 44));
+        if (expanded && !IsAnimating)
+            contents.Bounds = GetContentsBounds(ClientSize);
         Invalidate();
     }
+
+    private static Rectangle GetContentsBounds(Size size) =>
+        new(8, 36, Math.Max(0, size.Width - 16), Math.Max(0, size.Height - 44));
 
     protected override void OnLocationChanged(EventArgs e)
     {
@@ -306,7 +423,7 @@ internal sealed class FolderWindow : Form
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        if (expanded && !transition.Enabled)
+        if (expanded && !IsAnimating)
             DrawOutline(e.Graphics, ClientRectangle);
     }
 
@@ -369,7 +486,7 @@ internal sealed class FolderWindow : Form
         };
         handle.MouseMove += (_, e) =>
         {
-            if (e.Button != MouseButtons.Left || !handle.Capture || transition.Enabled)
+            if (e.Button != MouseButtons.Left || !handle.Capture || IsAnimating)
                 return;
             var delta = Cursor.Position - new Size(mouseStart);
             if (!dragging && Math.Abs(delta.X) + Math.Abs(delta.Y) < 5)
@@ -421,9 +538,11 @@ internal sealed class FolderWindow : Form
     private void RefreshContents()
     {
         preview.Invalidate();
-        if (!expanded)
+        if (!expanded || (displayedShortcuts == folder.Shortcuts && displayedAppearance == Appearance))
             return;
 
+        displayedShortcuts = folder.Shortcuts;
+        displayedAppearance = Appearance;
         contents.SuspendLayout();
         try
         {
@@ -443,26 +562,12 @@ internal sealed class FolderWindow : Form
                 var tile = MakeButton();
                 tile.Size = new Size(67, 65);
                 tile.Margin = new Padding(2);
-                string extension = Path.GetExtension(path);
-                string name = extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase) ||
-                    extension.Equals(".url", StringComparison.OrdinalIgnoreCase)
-                    ? Path.GetFileNameWithoutExtension(path) : Path.GetFileName(path);
+                string name = GetShortcutName(path);
                 tile.AccessibleName = name;
                 tile.Paint += (_, e) =>
                 {
-                    const int iconSide = 32;
-                    int iconLeft = (tile.ClientSize.Width - iconSide) / 2;
-                    e.Graphics.DrawImage(GetIcon(path), iconLeft, 5, iconSide, iconSide);
-                    var label = new Rectangle(2, 39, tile.ClientSize.Width - 4, 20);
-                    TextFormatFlags alignment = Appearance.ExpandedAlignment switch
-                    {
-                        HorizontalAlignment.Left => TextFormatFlags.Left,
-                        HorizontalAlignment.Right => TextFormatFlags.Right,
-                        _ => TextFormatFlags.HorizontalCenter
-                    };
-                    TextRenderer.DrawText(e.Graphics, name, tile.Font, label, tile.ForeColor,
-                        alignment | TextFormatFlags.VerticalCenter |
-                        TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                    e.Graphics.DrawImage(GetIcon(path), GetShortcutIconBounds(tile.ClientRectangle));
+                    DrawShortcutName(e.Graphics, name, tile.ClientRectangle, tile.ForeColor);
                 };
                 tile.Click += (_, _) => Launch(path);
                 var actions = new ContextMenuStrip();
@@ -481,7 +586,34 @@ internal sealed class FolderWindow : Form
         finally
         {
             contents.ResumeLayout();
+            if (IsAnimating)
+                CaptureTransitionShortcuts();
         }
+    }
+
+    private static string GetShortcutName(string path)
+    {
+        string extension = Path.GetExtension(path);
+        return extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".url", StringComparison.OrdinalIgnoreCase)
+            ? Path.GetFileNameWithoutExtension(path) : Path.GetFileName(path);
+    }
+
+    private static Rectangle GetShortcutIconBounds(Rectangle tile) => new(
+        tile.Left + (tile.Width - ShortcutIconSize) / 2, tile.Top + 5, ShortcutIconSize, ShortcutIconSize);
+
+    private void DrawShortcutName(Graphics graphics, string name, Rectangle tile, Color color)
+    {
+        TextFormatFlags alignment = Appearance.ExpandedAlignment switch
+        {
+            HorizontalAlignment.Left => TextFormatFlags.Left,
+            HorizontalAlignment.Right => TextFormatFlags.Right,
+            _ => TextFormatFlags.HorizontalCenter
+        };
+        var label = new Rectangle(tile.Left + 2, tile.Top + 39, tile.Width - 4, 20);
+        TextRenderer.DrawText(graphics, name, Font, label, color, alignment | TextFormatFlags.VerticalCenter |
+            TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
+            TextFormatFlags.PreserveGraphicsClipping);
     }
 
     private void EditAppearance()
@@ -523,25 +655,111 @@ internal sealed class FolderWindow : Form
     {
         if (folder.Shortcuts.Length == 0)
         {
-            TextRenderer.DrawText(e.Graphics, "＋", Font, preview.ClientRectangle, Color.Black,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-            DrawOutline(e.Graphics, preview.ClientRectangle);
-            return;
+            double opacity = Math.Max(0, 1 - expansion * 2);
+            if (opacity > 0)
+                TextRenderer.DrawText(e.Graphics, "＋", Font, preview.ClientRectangle, FadeText(Color.Black, opacity),
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
-
-        int count = Math.Min(folder.Shortcuts.Length, 9);
-        int columns = count > 4 ? 3 : count > 1 ? 2 : 1;
-        int cell = Math.Max(1, Math.Min(DesktopIconSize + 4, (preview.Width - 12) / columns));
-        int left = (preview.Width - Math.Min(count, columns) * cell) / 2;
-        int top = (preview.Height - ((count + columns - 1) / columns) * cell) / 2;
-        for (int i = 0; i < count; i++)
+        else if (IsAnimating)
+            PaintTransitionShortcuts(e.Graphics);
+        else
         {
-            int x = left + i % columns * cell;
-            int y = top + i / columns * cell;
-            int inset = cell > 8 ? 2 : 0;
-            e.Graphics.DrawImage(GetIcon(folder.Shortcuts[i]), x + inset, y + inset, cell - inset * 2, cell - inset * 2);
+            Rectangle[] thumbnails = GetThumbnailBounds(preview.Width);
+            for (int i = 0; i < thumbnails.Length; i++)
+                e.Graphics.DrawImage(GetIcon(folder.Shortcuts[i]), thumbnails[i]);
         }
         DrawOutline(e.Graphics, preview.ClientRectangle);
+    }
+
+    private Rectangle[] GetThumbnailBounds(int side)
+    {
+        int count = Math.Min(folder.Shortcuts.Length, 9);
+        int columns = count > 4 ? 3 : count > 1 ? 2 : 1;
+        int cell = Math.Max(1, Math.Min(DesktopIconSize + 4, (side - 12) / columns));
+        int left = (side - Math.Min(count, columns) * cell) / 2;
+        int top = (side - ((count + columns - 1) / columns) * cell) / 2;
+        int inset = cell > 8 ? 2 : 0;
+        int iconSide = cell - inset * 2;
+        var bounds = new Rectangle[count];
+        for (int i = 0; i < count; i++)
+            bounds[i] = new Rectangle(left + i % columns * cell + inset, top + i / columns * cell + inset,
+                iconSide, iconSide);
+        return bounds;
+    }
+
+    private void CaptureTransitionShortcuts()
+    {
+        Rectangle[] thumbnails = GetThumbnailBounds(GetFolderBounds(folder.Location, false).Width);
+        expandedViewport = contents.ClientRectangle;
+        expandedViewport.Offset(contents.Location);
+        var shortcuts = new List<TransitionShortcut>();
+        for (int i = 0; i < folder.Shortcuts.Length; i++)
+        {
+            var thumbnail = i < thumbnails.Length ? thumbnails[i] : Rectangle.Empty;
+            var tile = Rectangle.Empty;
+            if (i < contents.Controls.Count && contents.Controls[i] is Button button)
+            {
+                var bounds = button.Bounds;
+                bounds.Offset(contents.Location);
+                if (expandedViewport.IntersectsWith(bounds))
+                    tile = bounds;
+            }
+            if (!thumbnail.IsEmpty || !tile.IsEmpty)
+            {
+                string path = folder.Shortcuts[i];
+                shortcuts.Add(new TransitionShortcut(path, GetShortcutName(path), thumbnail, tile));
+            }
+        }
+        transitionShortcuts = shortcuts.ToArray();
+    }
+
+    private void PaintTransitionShortcuts(Graphics graphics)
+    {
+        double reveal = Math.Clamp((expansion - 0.30) / 0.65, 0, 1);
+        double labelOpacity = Math.Clamp((expansion - 0.60) / 0.38, 0, 1);
+        Color labelColor = FadeText(ExpandedTextColor, labelOpacity);
+        var state = graphics.Save();
+        graphics.IntersectClip(Lerp(preview.ClientRectangle, expandedViewport, expansion));
+        using var fade = new ImageAttributes();
+        foreach (var shortcut in transitionShortcuts)
+        {
+            bool hasTile = !shortcut.Tile.IsEmpty;
+            Rectangle target = hasTile ? GetShortcutIconBounds(shortcut.Tile) : shortcut.Thumbnail;
+            Rectangle icon = shortcut.Thumbnail.IsEmpty ? target : Lerp(shortcut.Thumbnail, target, expansion);
+            double opacity = shortcut.Thumbnail.IsEmpty ? reveal : hasTile ? 1 : 1 - reveal;
+            if (opacity >= 1)
+                graphics.DrawImage(GetIcon(shortcut.Path), icon);
+            else if (opacity > 0)
+            {
+                Bitmap image = GetIcon(shortcut.Path);
+                fade.SetColorMatrix(IconFade(Surface, (float)opacity));
+                graphics.DrawImage(image, icon, 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, fade);
+            }
+
+            if (hasTile && labelOpacity > 0)
+            {
+                Rectangle tile = shortcut.Tile;
+                tile.Offset(icon.Left - target.Left, icon.Top - target.Top);
+                DrawShortcutName(graphics, shortcut.Name, tile, labelColor);
+            }
+        }
+        graphics.Restore(state);
+    }
+
+    private Color FadeText(Color color, double opacity) => Color.FromArgb(
+        Lerp(Surface.R, color.R, opacity), Lerp(Surface.G, color.G, opacity), Lerp(Surface.B, color.B, opacity));
+
+    private static ColorMatrix IconFade(Color surface, float opacity)
+    {
+        // Blend toward the card surface without blending into the foreground window's transparency key.
+        float backgroundWeight = (1 - opacity) / 255;
+        return new ColorMatrix
+        {
+            Matrix00 = opacity, Matrix11 = opacity, Matrix22 = opacity,
+            Matrix40 = surface.R * backgroundWeight,
+            Matrix41 = surface.G * backgroundWeight,
+            Matrix42 = surface.B * backgroundWeight
+        };
     }
 
     private Bitmap GetIcon(string path)
@@ -614,11 +832,11 @@ internal sealed class FolderWindow : Form
 
     protected override void Dispose(bool disposing)
     {
+        activeTransition = null;
         base.Dispose(disposing);
         if (disposing)
         {
             tips.Dispose();
-            transition.Dispose();
             backdrop.Dispose();
             menu.Dispose();
             foreach (var icon in icons.Values)
@@ -669,6 +887,9 @@ internal sealed class FolderWindow : Form
             base.WndProc(ref message);
         }
     }
+
+    [DllImport("dwmapi.dll", ExactSpelling = true)]
+    private static extern int DwmFlush();
 
     [DllImport("user32.dll", EntryPoint = "SendMessageW")]
     private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);

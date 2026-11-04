@@ -6,11 +6,13 @@ internal sealed class DesktopApplication : ApplicationContext
     private readonly Dictionary<Guid, FolderWindow> windows = [];
     private readonly int cardUnit;
     private DesktopFolder[] folders;
+    private AnimationSettings animationSettings;
 
     public DesktopApplication(FolderStore store)
     {
         this.store = store;
         folders = store.Load();
+        animationSettings = store.LoadAnimationSettings();
         var grid = DesktopGrid.Read();
         cardUnit = grid.CardUnit(FolderWindow.DesktopIconSize);
         var restored = new List<DesktopFolder>();
@@ -50,7 +52,8 @@ internal sealed class DesktopApplication : ApplicationContext
         var window = new FolderWindow(folder,
             updated => Commit(folders.Select(item => item.Id == updated.Id ? updated : item).ToArray()),
             () => Delete(folder.Id),
-            updated => FindSlot(DesktopGrid.Read(), updated, folders), cardUnit);
+            updated => FindSlot(DesktopGrid.Read(), updated, folders), cardUnit,
+            () => animationSettings, UpdateAnimationSettings);
         windows.Add(folder.Id, window);
         window.ShowOnDesktop();
     }
@@ -79,15 +82,28 @@ internal sealed class DesktopApplication : ApplicationContext
 
     private bool Commit(DesktopFolder[] updated)
     {
+        if (!TrySave(() => store.Save(updated), "无法保存修改"))
+            return false;
+        folders = updated;
+        return true;
+    }
+
+    private void UpdateAnimationSettings(AnimationSettings updated)
+    {
+        if (TrySave(() => store.SaveAnimationSettings(updated), "无法保存动画设置"))
+            animationSettings = updated;
+    }
+
+    private static bool TrySave(Action save, string failureMessage)
+    {
         try
         {
-            store.Save(updated);
-            folders = updated;
+            save();
             return true;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
-            MessageBox.Show($"无法保存修改。\n\n{error.Message}", "DeskMaster",
+            MessageBox.Show($"{failureMessage}。\n\n{error.Message}", "DeskMaster",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
