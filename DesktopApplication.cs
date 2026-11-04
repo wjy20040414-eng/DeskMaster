@@ -12,6 +12,7 @@ internal sealed class DesktopApplication : ApplicationContext
     {
         this.store = store;
         folders = store.Load();
+        store.PreserveExistingShortcuts(folders);
         animationSettings = store.LoadAnimationSettings();
         var grid = DesktopGrid.Read();
         cardUnit = grid.CardUnit(FolderWindow.DesktopIconSize);
@@ -53,7 +54,8 @@ internal sealed class DesktopApplication : ApplicationContext
             updated => Commit(folders.Select(item => item.Id == updated.Id ? updated : item).ToArray()),
             () => Delete(folder.Id),
             updated => FindSlot(DesktopGrid.Read(), updated, folders), cardUnit,
-            () => animationSettings, UpdateAnimationSettings);
+            () => animationSettings, UpdateAnimationSettings,
+            path => store.ResolveShortcutPath(folder.Id, path));
         windows.Add(folder.Id, window);
         window.ShowOnDesktop();
     }
@@ -82,7 +84,7 @@ internal sealed class DesktopApplication : ApplicationContext
 
     private bool Commit(DesktopFolder[] updated)
     {
-        if (!TrySave(() => store.Save(updated), "无法保存修改"))
+        if (!TrySave(() => store.SaveChanges(folders, updated), "无法保存修改"))
             return false;
         folders = updated;
         return true;

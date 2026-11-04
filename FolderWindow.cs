@@ -12,11 +12,13 @@ internal sealed class FolderWindow : Form
     private static readonly FolderAppearance DefaultAppearance = new();
     internal const int CaptionHeight = 22;
     private const int TransitionMilliseconds = 220;
+    private const int MaximumHeaderClickWaitMilliseconds = 100;
     private const int ShortcutIconSize = 32;
     private const string DesktopViewKey = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\Shell\Bags\1\Desktop";
     private readonly Func<DesktopFolder, bool> save;
     private readonly Func<DesktopFolder, Point?> findSlot;
     private readonly Func<AnimationSettings> getAnimationSettings;
+    private readonly Func<string, string> resolveShortcutPath;
     private readonly int cardUnit;
     private readonly Button header;
     private readonly Button preview;
@@ -25,10 +27,16 @@ internal sealed class FolderWindow : Form
     private readonly BackgroundWindow backdrop;
     private readonly ContextMenuStrip menu;
     private readonly ToolTip tips = new();
+    private readonly System.Windows.Forms.Timer headerClickTimer = new();
     private readonly Dictionary<string, Bitmap> icons = new(StringComparer.OrdinalIgnoreCase);
     private DesktopFolder folder;
     private bool expanded;
     private bool dragging;
+    private bool headerDoubleClick;
+    private bool renameWhenExpanded;
+    private TextBox? nameEditor;
+    private Point pendingHeaderClick;
+    private long pendingHeaderClickAt;
     private Point mouseStart;
     private Point dragStart;
     private Rectangle transitionFrom;
@@ -47,6 +55,7 @@ internal sealed class FolderWindow : Form
     private readonly record struct TransitionShortcut(string Path, string Name, Rectangle Thumbnail, Rectangle Tile);
 
     private bool IsAnimating => activeTransition is not null;
+    private bool EditingTitle => nameEditor?.Parent == this;
     private FolderAppearance Appearance => folder.Appearance ?? DefaultAppearance;
     private Color Surface => AppearanceDialog.ToColor(Appearance.Background);
     private Color ExpandedTextColor => AppearanceDialog.ToColor(Appearance.ExpandedTextColor);
@@ -55,13 +64,15 @@ internal sealed class FolderWindow : Form
 
     public FolderWindow(DesktopFolder folder, Func<DesktopFolder, bool> save, Action delete,
         Func<DesktopFolder, Point?> findSlot, int cardUnit,
-        Func<AnimationSettings> getAnimationSettings, Action<AnimationSettings> saveAnimationSettings)
+        Func<AnimationSettings> getAnimationSettings, Action<AnimationSettings> saveAnimationSettings,
+        Func<string, string> resolveShortcutPath)
     {
         this.folder = folder;
         this.save = save;
         this.findSlot = findSlot;
         this.cardUnit = cardUnit;
         this.getAnimationSettings = getAnimationSettings;
+        this.resolveShortcutPath = resolveShortcutPath;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
@@ -71,7 +82,7 @@ internal sealed class FolderWindow : Form
         DoubleBuffered = true;
 
         menu = new ContextMenuStrip();
-        menu.Items.Add("重命名…", null, (_, _) => Rename());
+        menu.Items.Add("重命名", null, (_, _) => BeginRename());
         var sizeMenu = new ToolStripMenuItem("文件夹尺寸");
         for (int columns = 1; columns <= 3; columns++)
         {
@@ -88,6 +99,7 @@ internal sealed class FolderWindow : Form
         }
         menu.Opening += (_, _) =>
         {
+            headerClickTimer.Stop();
             foreach (ToolStripMenuItem choice in sizeMenu.DropDownItems)
                 choice.Checked = (int)choice.Tag! == this.folder.IconColumns;
         };
@@ -117,10 +129,13 @@ internal sealed class FolderWindow : Form
         caption.Click += (_, _) => Toggle();
         contents = new FlowLayoutPanel { AutoScroll = true, WrapContents = true };
         backdrop = new BackgroundWindow(this) { ContextMenuStrip = menu };
-        AcceptFiles(backdrop);
-        header.Click += (_, _) =>
+        AcceptItems(backdrop);
+        header.MouseDown += HeaderMouseDown;
+        header.Click += HeaderClick;
+        headerClickTimer.Tick += (_, _) =>
         {
-            if (!dragging)
+            headerClickTimer.Stop();
+            if (header.Visible && !dragging)
                 Toggle();
         };
         preview.Click += (_, _) =>
@@ -132,7 +147,7 @@ internal sealed class FolderWindow : Form
         AttachDragHandle(preview);
         Controls.AddRange([header, preview, contents, caption]);
         foreach (Control control in new Control[] { this, header, preview, contents, caption })
-            AcceptFiles(control);
+            AcceptItems(control);
 
         ApplyAppearance();
         UpdateTitle();
@@ -193,6 +208,11 @@ internal sealed class FolderWindow : Form
         backdrop.Show();
         if (!Visible)
             Show(backdrop);
+        RestoreDesktopOrder();
+    }
+
+    private void RestoreDesktopOrder()
+    {
         // HWND_BOTTOM and SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE.
         SetWindowPos(Handle, new IntPtr(1), 0, 0, 0, 0, 0x0013);
         SetWindowPos(backdrop.Handle, Handle, 0, 0, 0, 0, 0x0013);
@@ -200,7 +220,7 @@ internal sealed class FolderWindow : Form
 
     protected override void WndProc(ref Message message)
     {
-        if (message.Msg == 0x0021) // WM_MOUSEACTIVATE
+        if (message.Msg == 0x0021 && nameEditor is null) // WM_MOUSEACTIVATE
         {
             message.Result = new IntPtr(3); // MA_NOACTIVATE
             return;
@@ -220,12 +240,19 @@ internal sealed class FolderWindow : Form
 
     private void Toggle()
     {
+        headerClickTimer.Stop();
         bool wasAnimating = IsAnimating;
         var animationSettings = getAnimationSettings();
         transitionFrom = new Rectangle(Location, new Size(Width, Width));
         transitionOpacity = backdrop.Opacity;
         transitionFromExpansion = expansion;
         expanded = !expanded;
+        if (!expanded)
+        {
+            renameWhenExpanded = false;
+            if (nameEditor is not null)
+                FinishNameEdit(nameEditor);
+        }
         UpdateTitle();
         Rectangle target = GetFolderBounds(folder.Location, expanded);
         transitionTo = new Rectangle(target.Location, new Size(target.Width, target.Width));
@@ -255,17 +282,61 @@ internal sealed class FolderWindow : Form
             _ = RenderTransitionAsync(animation, animationSettings.FrameRate);
     }
 
+    private void HeaderMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left)
+            return;
+
+        Size size = SystemInformation.DoubleClickSize;
+        var bounds = new Rectangle(pendingHeaderClick.X - size.Width / 2,
+            pendingHeaderClick.Y - size.Height / 2, size.Width, size.Height);
+        headerDoubleClick = headerClickTimer.Enabled &&
+            Stopwatch.GetElapsedTime(pendingHeaderClickAt).TotalMilliseconds <= headerClickTimer.Interval &&
+            bounds.Contains(header.PointToScreen(e.Location));
+        // Pause the first click as soon as the second press starts, including when it turns into a drag.
+        headerClickTimer.Stop();
+    }
+
+    private void HeaderClick(object? sender, EventArgs e)
+    {
+        if (dragging || !header.Visible)
+            return;
+        if (e is not MouseEventArgs mouse)
+        {
+            Toggle();
+            return;
+        }
+
+        if (headerDoubleClick)
+        {
+            headerDoubleClick = false;
+            // Move keyboard focus after the button finishes mouse-up and releases capture.
+            BeginInvoke(() =>
+            {
+                if (header.Visible)
+                    BeginRename();
+            });
+            return;
+        }
+
+        pendingHeaderClick = header.PointToScreen(mouse.Location);
+        pendingHeaderClickAt = Stopwatch.GetTimestamp();
+        headerClickTimer.Interval = Math.Min(SystemInformation.DoubleClickTime, MaximumHeaderClickWaitMilliseconds);
+        headerClickTimer.Start();
+    }
+
     private sealed class ForegroundButton : Button
     {
         protected override void WndProc(ref Message message)
         {
             if (message.Msg == 0x0202 && Capture && FindForm() is FolderWindow folder)
             {
-                Point point = Cursor.Position;
+                Point screen = Cursor.Position;
+                Point point = PointToClient(screen);
                 // WinForms normally tests the window under the pointer before raising Click.
                 // A transparent pixel inside this button can hit the card's background instead.
-                if (ClientRectangle.Contains(PointToClient(point)) && WindowFromPoint(point) == folder.backdrop.Handle)
-                    OnClick(EventArgs.Empty);
+                if (ClientRectangle.Contains(point) && WindowFromPoint(screen) == folder.backdrop.Handle)
+                    OnClick(new MouseEventArgs(MouseButtons.Left, 1, point.X, point.Y, 0));
             }
             base.WndProc(ref message);
         }
@@ -367,11 +438,13 @@ internal sealed class FolderWindow : Form
         transitionShortcuts = [];
         backdrop.Opacity = TargetOpacity;
         Bounds = GetFolderBounds(requested, expanded);
-        header.Visible = expanded;
+        header.Visible = expanded && !EditingTitle;
         contents.Visible = expanded;
         preview.Visible = !expanded;
         caption.Visible = !expanded;
         preview.Invalidate();
+        if (expanded && renameWhenExpanded)
+            BeginRename();
     }
 
     protected override void OnResize(EventArgs e)
@@ -392,6 +465,8 @@ internal sealed class FolderWindow : Form
         Region = region;
 
         header.Bounds = new Rectangle(12, 4, Math.Max(0, Width - 24), 30);
+        if (nameEditor is not null && EditingTitle)
+            PositionTitleEditor(nameEditor);
         preview.Bounds = new Rectangle(0, 0, side, side);
         caption.Bounds = new Rectangle(0, side, side, CaptionHeight);
         if (expanded && !IsAnimating)
@@ -512,17 +587,80 @@ internal sealed class FolderWindow : Form
         ApplyLocation(folder.Location);
     }
 
-    private void AcceptFiles(Control target)
+    private void AttachShortcutDrag(Button tile, string path)
+    {
+        Rectangle dragArea = Rectangle.Empty;
+        bool draggingItem = false;
+
+        tile.MouseDown += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left)
+                return;
+
+            headerClickTimer.Stop();
+            Point point = Cursor.Position;
+            Size threshold = SystemInformation.DragSize;
+            dragArea = new Rectangle(point.X - threshold.Width / 2, point.Y - threshold.Height / 2,
+                threshold.Width, threshold.Height);
+        };
+        tile.MouseMove += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left || !tile.Capture || draggingItem || dragArea.Contains(Cursor.Position))
+                return;
+
+            draggingItem = true;
+            tile.Cursor = Cursor.Current = Cursors.SizeAll;
+        };
+        tile.Click += (_, _) =>
+        {
+            if (!draggingItem)
+                Launch(resolveShortcutPath(path));
+        };
+        tile.MouseUp += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left && draggingItem && expanded && !IsAnimating &&
+                !Bounds.Contains(Cursor.Position))
+                BeginInvoke(() => RemoveShortcut(path));
+        };
+        tile.MouseCaptureChanged += (_, _) =>
+        {
+            if (tile.Capture || !draggingItem)
+                return;
+
+            draggingItem = false;
+            tile.Cursor = Cursors.Hand;
+            Cursor.Current = tile.ClientRectangle.Contains(tile.PointToClient(Cursor.Position))
+                ? Cursors.Hand : Cursors.Default;
+        };
+    }
+
+    private void RemoveShortcut(string path)
+    {
+        string[] remaining = folder.Shortcuts.Where(item => item != path).ToArray();
+        if (remaining.Length == folder.Shortcuts.Length)
+            return;
+
+        var names = folder.ShortcutNames is null ? null : new Dictionary<string, string>(folder.ShortcutNames);
+        names?.Remove(path);
+        if (!Save(folder with { Shortcuts = remaining, ShortcutNames = names is { Count: > 0 } ? names : null }))
+            return;
+
+        if (icons.Remove(path, out var icon))
+            icon.Dispose();
+        RefreshContents();
+    }
+
+    private void AcceptItems(Control target)
     {
         target.AllowDrop = true;
         target.DragEnter += (_, e) => e.Effect =
-            e.AllowedEffect.HasFlag(DragDropEffects.Copy) && DroppedFiles(e.Data).Any()
+            e.AllowedEffect.HasFlag(DragDropEffects.Copy) && DroppedItems(e.Data).Any()
                 ? DragDropEffects.Copy : DragDropEffects.None;
         target.DragDrop += (_, e) =>
         {
             if (!e.AllowedEffect.HasFlag(DragDropEffects.Copy))
                 return;
-            string[] dropped = DroppedFiles(e.Data).ToArray();
+            string[] dropped = DroppedItems(e.Data).ToArray();
             e.Effect = dropped.Length > 0 ? DragDropEffects.Copy : DragDropEffects.None;
             var shortcuts = folder.Shortcuts.Concat(dropped)
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -531,9 +669,9 @@ internal sealed class FolderWindow : Form
         };
     }
 
-    private static IEnumerable<string> DroppedFiles(IDataObject? data) =>
+    private static IEnumerable<string> DroppedItems(IDataObject? data) =>
         (data?.GetData(DataFormats.FileDrop, autoConvert: false) as string[] ?? [])
-            .Where(File.Exists);
+            .Where(path => File.Exists(path) || Directory.Exists(path));
 
     private void RefreshContents()
     {
@@ -541,6 +679,8 @@ internal sealed class FolderWindow : Form
         if (!expanded || (displayedShortcuts == folder.Shortcuts && displayedAppearance == Appearance))
             return;
 
+        if (nameEditor is not null && !EditingTitle)
+            FinishNameEdit(nameEditor);
         displayedShortcuts = folder.Shortcuts;
         displayedAppearance = Appearance;
         contents.SuspendLayout();
@@ -551,8 +691,8 @@ internal sealed class FolderWindow : Form
 
             if (folder.Shortcuts.Length == 0)
             {
-                var hint = new Label { AutoSize = true, Text = "拖入文件或快捷方式", ForeColor = ExpandedTextColor, Margin = new Padding(8) };
-                AcceptFiles(hint);
+                var hint = new Label { AutoSize = true, Text = "拖入文件、文件夹或快捷方式", ForeColor = ExpandedTextColor, Margin = new Padding(8) };
+                AcceptItems(hint);
                 contents.Controls.Add(hint);
                 return;
             }
@@ -562,24 +702,19 @@ internal sealed class FolderWindow : Form
                 var tile = MakeButton();
                 tile.Size = new Size(67, 65);
                 tile.Margin = new Padding(2);
-                string name = GetShortcutName(path);
-                tile.AccessibleName = name;
+                tile.Tag = path;
+                UpdateShortcutLabel(tile, path);
                 tile.Paint += (_, e) =>
                 {
                     e.Graphics.DrawImage(GetIcon(path), GetShortcutIconBounds(tile.ClientRectangle));
-                    DrawShortcutName(e.Graphics, name, tile.ClientRectangle, tile.ForeColor);
+                    DrawShortcutName(e.Graphics, tile.AccessibleName!, tile.ClientRectangle, tile.ForeColor);
                 };
-                tile.Click += (_, _) => Launch(path);
+                AttachShortcutDrag(tile, path);
                 var actions = new ContextMenuStrip();
-                actions.Items.Add("从文件夹移除", null, (_, _) =>
-                {
-                    if (Save(folder with { Shortcuts = folder.Shortcuts.Where(item => item != path).ToArray() }))
-                        RefreshContents();
-                });
+                actions.Items.Add("重命名", null, (_, _) => BeginInvoke(() => BeginShortcutRename(tile, path)));
                 tile.ContextMenuStrip = actions;
                 tile.Disposed += (_, _) => actions.Dispose();
-                tips.SetToolTip(tile, name);
-                AcceptFiles(tile);
+                AcceptItems(tile);
                 contents.Controls.Add(tile);
             }
         }
@@ -591,12 +726,28 @@ internal sealed class FolderWindow : Form
         }
     }
 
-    private static string GetShortcutName(string path)
+    private string GetShortcutName(string path) =>
+        folder.ShortcutNames?.TryGetValue(path, out var name) == true && !string.IsNullOrWhiteSpace(name)
+            ? name : GetShortcutFileName(path);
+
+    private static string GetShortcutFileName(string path)
     {
-        string extension = Path.GetExtension(path);
-        return extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".url", StringComparison.OrdinalIgnoreCase)
-            ? Path.GetFileNameWithoutExtension(path) : Path.GetFileName(path);
+        string name = Path.GetFileName(Path.TrimEndingDirectorySeparator(path));
+        if (name.Length == 0)
+            return path;
+
+        string extension = Path.GetExtension(name);
+        bool isShortcut = extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".url", StringComparison.OrdinalIgnoreCase);
+        return isShortcut && !Directory.Exists(path) ? Path.GetFileNameWithoutExtension(name) : name;
+    }
+
+    private void UpdateShortcutLabel(Button tile, string path)
+    {
+        string name = GetShortcutName(path);
+        tile.AccessibleName = name;
+        tips.SetToolTip(tile, name);
+        tile.Invalidate();
     }
 
     private static Rectangle GetShortcutIconBounds(Rectangle tile) => new(
@@ -610,11 +761,13 @@ internal sealed class FolderWindow : Form
             HorizontalAlignment.Right => TextFormatFlags.Right,
             _ => TextFormatFlags.HorizontalCenter
         };
-        var label = new Rectangle(tile.Left + 2, tile.Top + 39, tile.Width - 4, 20);
-        TextRenderer.DrawText(graphics, name, Font, label, color, alignment | TextFormatFlags.VerticalCenter |
+        TextRenderer.DrawText(graphics, name, Font, GetShortcutLabelBounds(tile), color, alignment | TextFormatFlags.VerticalCenter |
             TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
             TextFormatFlags.PreserveGraphicsClipping);
     }
+
+    private static Rectangle GetShortcutLabelBounds(Rectangle tile) =>
+        new(tile.Left + 2, tile.Top + 39, tile.Width - 4, 20);
 
     private void EditAppearance()
     {
@@ -697,18 +850,19 @@ internal sealed class FolderWindow : Form
         {
             var thumbnail = i < thumbnails.Length ? thumbnails[i] : Rectangle.Empty;
             var tile = Rectangle.Empty;
+            string name = "";
             if (i < contents.Controls.Count && contents.Controls[i] is Button button)
             {
                 var bounds = button.Bounds;
                 bounds.Offset(contents.Location);
                 if (expandedViewport.IntersectsWith(bounds))
+                {
                     tile = bounds;
+                    name = button.AccessibleName!;
+                }
             }
             if (!thumbnail.IsEmpty || !tile.IsEmpty)
-            {
-                string path = folder.Shortcuts[i];
-                shortcuts.Add(new TransitionShortcut(path, GetShortcutName(path), thumbnail, tile));
-            }
+                shortcuts.Add(new TransitionShortcut(folder.Shortcuts[i], name, thumbnail, tile));
         }
         transitionShortcuts = shortcuts.ToArray();
     }
@@ -767,7 +921,8 @@ internal sealed class FolderWindow : Form
         if (icons.TryGetValue(path, out var cached))
             return cached;
         const uint systemIconIndex = 0x4000; // SHGFI_SYSICONINDEX
-        IntPtr imageList = SHGetFileInfoW(path, 0, out var info, (uint)Marshal.SizeOf<ShellFileInfo>(), systemIconIndex);
+        IntPtr imageList = SHGetFileInfoW(resolveShortcutPath(path), 0, out var info,
+            (uint)Marshal.SizeOf<ShellFileInfo>(), systemIconIndex);
         IntPtr handle = imageList == IntPtr.Zero
             ? IntPtr.Zero
             : ImageList_GetIcon(imageList, info.IconIndex, 1); // ILD_TRANSPARENT, with no overlay mask
@@ -810,32 +965,119 @@ internal sealed class FolderWindow : Form
         return true;
     }
 
-    private void Rename()
+    private void BeginRename()
     {
-        using var dialog = new Form
+        if (!expanded || IsAnimating)
         {
-            Text = "重命名文件夹", StartPosition = FormStartPosition.CenterScreen,
-            FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false,
-            ShowInTaskbar = false, ClientSize = new Size(310, 87), Font = Font
+            renameWhenExpanded = true;
+            if (!expanded)
+                Toggle();
+            return;
+        }
+
+        renameWhenExpanded = false;
+        BeginNameEdit(this, folder.Name, 48, "文件夹名称", name =>
+        {
+            if (name != folder.Name && Save(folder with { Name = name }))
+                UpdateTitle();
+        });
+    }
+
+    private void BeginShortcutRename(Button tile, string path)
+    {
+        if (tile.IsDisposed || !tile.Visible || IsAnimating)
+            return;
+
+        BeginNameEdit(tile, GetShortcutName(path), 255, "快捷方式名称", name => SaveShortcutName(path, name));
+    }
+
+    private void SaveShortcutName(string path, string name)
+    {
+        if (name == GetShortcutName(path) || !folder.Shortcuts.Contains(path))
+            return;
+
+        Dictionary<string, string> names = folder.ShortcutNames is null ? new() : new(folder.ShortcutNames);
+        if (name == GetShortcutFileName(path))
+            names.Remove(path);
+        else
+            names[path] = name;
+
+        if (Save(folder with { ShortcutNames = names.Count > 0 ? names : null }))
+        {
+            foreach (Button tile in contents.Controls.OfType<Button>().Where(tile => (string?)tile.Tag == path))
+                UpdateShortcutLabel(tile, path);
+        }
+    }
+
+    private void BeginNameEdit(Control host, string name, int maxLength, string accessibleName, Action<string> apply)
+    {
+        headerClickTimer.Stop();
+        if (nameEditor is not null)
+        {
+            if (nameEditor.Parent == host)
+            {
+                nameEditor.Focus();
+                return;
+            }
+            FinishNameEdit(nameEditor);
+        }
+
+        var editor = new TextBox { Text = name, MaxLength = maxLength, AccessibleName = accessibleName };
+        nameEditor = editor;
+        editor.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode is not (Keys.Enter or Keys.Escape))
+                return;
+            e.SuppressKeyPress = true;
+            FinishNameEdit(editor, e.KeyCode == Keys.Enter ? apply : null);
         };
-        var name = new TextBox { Text = folder.Name, MaxLength = 48, Bounds = new Rectangle(12, 12, 286, 27) };
-        var ok = new Button { Text = "确定", DialogResult = DialogResult.OK, Bounds = new Rectangle(141, 48, 75, 27) };
-        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(223, 48, 75, 27) };
-        dialog.Controls.AddRange([name, ok, cancel]);
-        dialog.AcceptButton = ok;
-        dialog.CancelButton = cancel;
-        name.SelectAll();
-        if (dialog.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(name.Text) &&
-            Save(folder with { Name = name.Text.Trim() }))
-            UpdateTitle();
+        editor.LostFocus += (_, _) => FinishNameEdit(editor, apply);
+        host.Controls.Add(editor);
+        if (host == this)
+        {
+            header.Hide();
+            PositionTitleEditor(editor);
+        }
+        else
+        {
+            editor.Bounds = GetShortcutLabelBounds(host.ClientRectangle);
+        }
+        editor.BringToFront();
+        Activate();
+        editor.Focus();
+        editor.SelectAll();
+    }
+
+    private void PositionTitleEditor(TextBox editor)
+    {
+        int height = editor.PreferredHeight;
+        editor.Bounds = new Rectangle(header.Left, header.Top + (header.Height - height) / 2, header.Width, height);
+    }
+
+    private void FinishNameEdit(TextBox editor, Action<string>? apply = null)
+    {
+        if (nameEditor != editor)
+            return;
+
+        bool editingTitle = EditingTitle;
+        nameEditor = null;
+        string name = editor.Text.Trim();
+        editor.Dispose();
+        if (name.Length > 0)
+            apply?.Invoke(name);
+        if (editingTitle)
+            header.Visible = expanded && !IsAnimating;
+        RestoreDesktopOrder();
     }
 
     protected override void Dispose(bool disposing)
     {
         activeTransition = null;
+        nameEditor = null;
         base.Dispose(disposing);
         if (disposing)
         {
+            headerClickTimer.Dispose();
             tips.Dispose();
             backdrop.Dispose();
             menu.Dispose();
