@@ -11,11 +11,14 @@ internal static class Program
             ["--exit"] => FolderCommand.Exit,
             _ => FolderCommand.Show
         };
-        if (args is ["--install-desktop-menu"] or ["--remove-desktop-menu"])
+        if (args is ["--install-desktop-menu"] or ["--remove-desktop-menu"] or
+                    ["--install-desktop-menu-system"] or ["--remove-desktop-menu-system"])
         {
             try
             {
-                DesktopMenu.Configure(install: args[0] == "--install-desktop-menu");
+                DesktopMenu.Configure(
+                    install: args[0] is "--install-desktop-menu" or "--install-desktop-menu-system",
+                    machineWide: args[0] is "--install-desktop-menu-system" or "--remove-desktop-menu-system");
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
             {
@@ -45,7 +48,7 @@ internal static class Program
         try
         {
             using var application = new DesktopApplication(FolderStore.ForCurrentUser());
-            using var commands = new FolderCommandWindow(request =>
+            void RunCommand(FolderCommand request)
             {
                 switch (request)
                 {
@@ -53,9 +56,10 @@ internal static class Program
                     case FolderCommand.Show: application.ShowFolders(); break;
                     case FolderCommand.Exit: application.ExitThread(); break;
                 }
-            });
-            if (command == FolderCommand.Create)
-                application.CreateFolder();
+            }
+            using var commands = new FolderCommandWindow(RunCommand);
+            if (command != FolderCommand.Show)
+                RunCommand(command);
             Application.Run(application);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)

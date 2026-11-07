@@ -11,6 +11,8 @@ dotnet build -c Release
 .\bin\Release\net8.0-windows\DeskMaster.exe
 ```
 
+要在每次登录 Windows 后自动恢复已保存的桌面文件夹，请在构建后运行 `.\Set-DeskMasterStartup.ps1`。脚本为当前用户注册登录任务，登录约 20 秒后在后台启动 DeskMaster。移动项目后需重新运行脚本。关闭自动启动可运行 `.\Set-DeskMasterStartup.ps1 -Remove`。
+
 ## 操作
 
 - 注册一次右键菜单后，在桌面空白处右击，选择「显示更多选项」→「新建桌面文件夹」。也可用 `Shift + F10` 打开经典菜单。DeskMaster 会在需要时启动。
@@ -22,7 +24,7 @@ dotnet build -c Release
 - 右击任意卡片，打开「动画设置（全局）」，可独立选择帧率和播放速度。默认随屏幕刷新并以 1× 播放，设置对所有文件夹生效，重启后仍会保留。
 - 右击标题可重命名或删除文件夹。
 
-文件夹卡片位于普通应用窗口下方。可从桌面右键菜单选择「显示桌面文件夹」重新显示卡片。位置、尺寸和文件引用保存于 `%LOCALAPPDATA%\DeskMaster\folders.json`。普通文件和文件夹仍通过原路径打开，快捷方式的副本和配置保存在同一个 DeskMaster 数据目录下。
+文件夹卡片位于普通应用窗口下方。可从桌面右键菜单选择「显示桌面文件夹」重新显示卡片。位置、尺寸和文件引用保存于 `%USERPROFILE%\.deskmaster\folders.json`。首次运行时，DeskMaster 会从旧版的 `%LOCALAPPDATA%\DeskMaster\folders.json` 导入已有记录。普通文件和文件夹仍通过原路径打开，快捷方式的副本和配置保存在同一个 DeskMaster 数据目录下。
 
 ## 桌面右键菜单
 
@@ -37,3 +39,11 @@ Start-Process -FilePath .\bin\Release\net8.0-windows\DeskMaster.exe -ArgumentLis
 ```powershell
 Start-Process -FilePath .\bin\Release\net8.0-windows\DeskMaster.exe -ArgumentList '--remove-desktop-menu' -Wait
 ```
+
+如果桌面的「显示更多选项」没有列出当前用户注册的命令，可用管理员权限为这台电脑注册桌面菜单。
+
+```powershell
+Start-Process -FilePath .\bin\Release\net8.0-windows\DeskMaster.exe -ArgumentList '--install-desktop-menu-system' -Verb RunAs -Wait
+```
+
+移除系统级菜单时，将参数替换为 `--remove-desktop-menu-system`。

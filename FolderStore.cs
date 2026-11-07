@@ -27,24 +27,38 @@ internal sealed record AnimationSettings(int FrameRate = 0, int SpeedPercent = 1
         Speeds.Contains(SpeedPercent) ? SpeedPercent : 100);
 }
 
-internal sealed class FolderStore(string path)
+internal sealed class FolderStore(string path, string? legacyPath = null)
 {
     private sealed record Entry(Guid Id, string Name, int X, int Y, string[] Shortcuts, int IconColumns = 1,
         FolderAppearance? Appearance = null,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsDesktopShortcut = false,
         [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyDictionary<string, string>? ShortcutNames = null);
 
     private string AnimationPath => Path.Combine(Path.GetDirectoryName(path)!, "animation.json");
 
-    public static FolderStore ForCurrentUser() => new(Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeskMaster", "folders.json"));
+    public static FolderStore ForCurrentUser() => new(
+        // AppData can be redirected when the app is launched from a packaged process.
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".deskmaster", "folders.json"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeskMaster", "folders.json"));
 
     public DesktopFolder[] Load()
     {
-        if (!File.Exists(path))
+        if (File.Exists(path))
+            return Read(path);
+        if (legacyPath is null || !File.Exists(legacyPath))
             return [];
 
-        var entries = JsonSerializer.Deserialize<Entry[]>(File.ReadAllBytes(path))
+        var folders = Read(legacyPath);
+        Save(folders);
+        return folders;
+    }
+
+    private static DesktopFolder[] Read(string filePath)
+    {
+        var entries = JsonSerializer.Deserialize<Entry[]>(File.ReadAllBytes(filePath))
             ?? throw new JsonException("缺少文件夹列表。");
+        // Older versions also stored standalone colored shortcuts in this file.
+        entries = entries.Where(entry => entry is not { IsDesktopShortcut: true }).ToArray();
         if (entries.Any(entry => entry is null || string.IsNullOrWhiteSpace(entry.Name) ||
                 entry.IconColumns is < 1 or > 3 || entry.Shortcuts is null ||
                 entry.Shortcuts.Any(shortcut => string.IsNullOrWhiteSpace(shortcut))) ||

@@ -129,7 +129,6 @@ internal sealed class FolderWindow : Form
         caption.Click += (_, _) => Toggle();
         contents = new FlowLayoutPanel { AutoScroll = true, WrapContents = true };
         backdrop = new BackgroundWindow(this) { ContextMenuStrip = menu };
-        AcceptItems(backdrop);
         header.MouseDown += HeaderMouseDown;
         header.Click += HeaderClick;
         headerClickTimer.Tick += (_, _) =>
@@ -146,7 +145,7 @@ internal sealed class FolderWindow : Form
         AttachDragHandle(header);
         AttachDragHandle(preview);
         Controls.AddRange([header, preview, contents, caption]);
-        foreach (Control control in new Control[] { this, header, preview, contents, caption })
+        foreach (Control control in new Control[] { this, header, preview, contents, caption, backdrop })
             AcceptItems(control);
 
         ApplyAppearance();

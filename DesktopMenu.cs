@@ -5,7 +5,9 @@ namespace DeskMaster;
 
 internal static class DesktopMenu
 {
-    private const string KeyPrefix = @"Software\Classes\DesktopBackground\Shell\DeskMaster.";
+    private const string DirectoryKeyPrefix = @"Software\Classes\Directory\Background\Shell\DeskMaster.";
+    private const string DesktopKeyPrefix = @"Software\Classes\DesktopBackground\Shell\DeskMaster.";
+    private const string RemovedShortcutCommand = "ColoredShortcut";
     private static readonly (string Key, string Label, string Argument)[] Commands =
     [
         ("NewFolder", "新建桌面文件夹", "--new-folder"),
@@ -13,8 +15,10 @@ internal static class DesktopMenu
         ("Exit", "退出 DeskMaster", "--exit")
     ];
 
-    public static void Configure(bool install)
+    public static void Configure(bool install, bool machineWide = false)
     {
+        RegistryKey hive = machineWide ? Registry.LocalMachine : Registry.CurrentUser;
+        string prefix = machineWide ? DesktopKeyPrefix : DirectoryKeyPrefix;
         if (install)
         {
             string executable = Path.Combine(AppContext.BaseDirectory, "DeskMaster.exe");
@@ -23,7 +27,7 @@ internal static class DesktopMenu
 
             foreach (var item in Commands)
             {
-                using var entry = Registry.CurrentUser.CreateSubKey(KeyPrefix + item.Key);
+                using var entry = hive.CreateSubKey(prefix + item.Key);
                 using var command = entry.CreateSubKey("command");
                 command.SetValue("", $"\"{executable}\" {item.Argument}");
                 entry.SetValue("", item.Label);
@@ -32,7 +36,15 @@ internal static class DesktopMenu
         }
         else
             foreach (var item in Commands)
-                Registry.CurrentUser.DeleteSubKeyTree(KeyPrefix + item.Key, throwOnMissingSubKey: false);
+                hive.DeleteSubKeyTree(prefix + item.Key, throwOnMissingSubKey: false);
+
+        hive.DeleteSubKeyTree(prefix + RemovedShortcutCommand, throwOnMissingSubKey: false);
+        if (!machineWide)
+        {
+            foreach (var item in Commands)
+                hive.DeleteSubKeyTree(DesktopKeyPrefix + item.Key, throwOnMissingSubKey: false);
+            hive.DeleteSubKeyTree(DesktopKeyPrefix + RemovedShortcutCommand, throwOnMissingSubKey: false);
+        }
 
         SHChangeNotify(0x08000000, 0, IntPtr.Zero, IntPtr.Zero); // SHCNE_ASSOCCHANGED
     }

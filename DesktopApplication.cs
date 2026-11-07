@@ -36,8 +36,11 @@ internal sealed class DesktopApplication : ApplicationContext
 
     internal void CreateFolder()
     {
-        Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
-        var folder = new DesktopFolder(Guid.NewGuid(), "新建文件夹", area.Location, 1, []);
+        Add(new DesktopFolder(Guid.NewGuid(), "新建文件夹", Screen.FromPoint(Cursor.Position).WorkingArea.Location, 1, []));
+    }
+
+    private void Add(DesktopFolder folder)
+    {
         if (FindSlot(DesktopGrid.Read(), folder, folders) is not Point slot)
         {
             MessageBox.Show("当前屏幕没有可用的桌面格子。", "DeskMaster");
